@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { ChangeEvent } from "react";
 import * as XLSX from "xlsx";
 
@@ -50,6 +50,46 @@ function buildColumnWidths(rows: Row[]) {
   });
 }
 
+function shouldAnnotateCountryColumn(header: string) {
+  const normalized = header.trim().toLowerCase();
+  return normalized === "nationalität" || normalized.endsWith("land");
+}
+
+function isNationalityColumn(header: string) {
+  return header.trim().toLowerCase() === "nationalität";
+}
+
+function normalizeCountryCode(value: Cell) {
+  return String(value ?? "").trim().toUpperCase();
+}
+
+function getBaseUrl() {
+  return import.meta.env.BASE_URL.endsWith("/")
+    ? import.meta.env.BASE_URL
+    : `${import.meta.env.BASE_URL}/`;
+}
+
+function formatStudyPrettyName(name: string, level: string) {
+  const cleanName = name.trim();
+  const cleanLevel = level.trim();
+  if (!cleanName || !cleanLevel) return "";
+  return `${cleanName} (${cleanLevel})`;
+}
+
+function mapStudiumText(value: Cell, lookup: Map<string, string>) {
+  const raw = String(value ?? "");
+  if (!raw.trim()) return raw;
+  return raw
+    .split(",")
+    .map((part) => {
+      const key = part.trim();
+      if (!key) return "";
+      return lookup.get(key) ?? key;
+    })
+    .filter((part) => part.length > 0)
+    .join(", ");
+}
+
 export default function App() {
   const [fileName, setFileName] = useState("");
   const [headers, setHeaders] = useState<string[]>([]);
@@ -61,6 +101,63 @@ export default function App() {
   const [exportMode, setExportMode] = useState<"student" | "statistics">(
     "student",
   );
+  const [studyNameLookup, setStudyNameLookup] = useState<Map<string, string>>(
+    () => new Map(),
+  );
+
+  useEffect(() => {
+    let active = true;
+    async function loadStudyNames() {
+      try {
+        const response = await fetch(`${getBaseUrl()}study_names.csv`, {
+          cache: "no-store",
+        });
+        if (!response.ok) return;
+
+        const csvText = await response.text();
+        const workbook = XLSX.read(csvText, { type: "string" });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const csvRows = XLSX.utils.sheet_to_json(sheet, {
+          header: 1,
+          defval: "",
+          blankrows: false,
+        }) as Cell[][];
+
+        const [headerRow, ...dataRows] = csvRows;
+        const csvHeader = (headerRow ?? []).map((value) =>
+          String(value ?? "").trim().toLowerCase(),
+        );
+        const dnameIndex = csvHeader.indexOf("dname");
+        const nameIndex = csvHeader.indexOf("name");
+        const levelIndex = csvHeader.indexOf("level");
+        if (dnameIndex < 0 || nameIndex < 0 || levelIndex < 0) return;
+
+        const nextLookup = new Map<string, string>();
+        dataRows.forEach((row) => {
+          const dname = String(row[dnameIndex] ?? "").trim();
+          const name = String(row[nameIndex] ?? "").trim();
+          const level = String(row[levelIndex] ?? "").trim();
+          const pretty = formatStudyPrettyName(name, level);
+          if (dname && pretty) {
+            nextLookup.set(dname, pretty);
+          }
+        });
+
+        if (active) {
+          setStudyNameLookup(nextLookup);
+        }
+      } catch {
+        if (active) {
+          setStudyNameLookup(new Map());
+        }
+      }
+    }
+
+    loadStudyNames();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const columnIndex = useMemo(() => {
     if (!filterColumn) return -1;
@@ -69,8 +166,20 @@ export default function App() {
 
   const studiumOptions = useMemo(() => {
     if (columnIndex < 0) return [];
-    return unique(rows.map((row) => String(row[columnIndex] ?? ""))).sort();
-  }, [rows, columnIndex]);
+    const values = unique(rows.map((row) => String(row[columnIndex] ?? "")));
+    if (filterColumn !== "Studium") {
+      return values.sort();
+    }
+    return values.sort((left, right) => {
+      const prettyLeft = mapStudiumText(left, studyNameLookup);
+      const prettyRight = mapStudiumText(right, studyNameLookup);
+      const byPretty = prettyLeft.localeCompare(prettyRight, "de", {
+        sensitivity: "base",
+      });
+      if (byPretty !== 0) return byPretty;
+      return left.localeCompare(right, "de", { sensitivity: "base" });
+    });
+  }, [rows, columnIndex, filterColumn, studyNameLookup]);
 
   const studiumCounts = useMemo(() => {
     if (columnIndex < 0) return new Map<string, number>();
@@ -100,6 +209,7 @@ export default function App() {
     () => new Set(DIMMED_COLUMNS.map((name) => name.toLowerCase())),
     [],
   );
+  const availableFilterColumns = useMemo(() => new Set(headers), [headers]);
 
   const trimmedRows = useMemo(() => {
     if (selectedColumnIndexes.length === 0) return [];
@@ -298,19 +408,100 @@ export default function App() {
     setSelectedColumns(checked ? headers : []);
   }
 
-  function handleDownload() {
+  async function handleDownload() {
     if (selectedColumnIndexes.length === 0) return;
-    const output: Row[] = [
-      selectedColumnIndexes.map((item) => item.header),
-      ...processedRows,
-    ];
+    setError("");
+
+    let countryLookup = new Map<string, string>();
+    let feeLookup = new Map<string, string>();
+    let shouldAugmentCountryData = true;
+    try {
+      const response = await fetch(`${getBaseUrl()}countries.csv`, {
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        throw new Error(`countries.csv could not be loaded (${response.status}).`);
+      }
+      const csvText = await response.text();
+      const csvWorkbook = XLSX.read(csvText, { type: "string" });
+      const csvSheet = csvWorkbook.Sheets[csvWorkbook.SheetNames[0]];
+      const csvRows = XLSX.utils.sheet_to_json(csvSheet, {
+        header: 1,
+        defval: "",
+        blankrows: false,
+      }) as Cell[][];
+
+      const [csvHeaderRow, ...csvDataRows] = csvRows;
+      const csvHeader = (csvHeaderRow ?? []).map((value) =>
+        String(value ?? "").trim().toLowerCase(),
+      );
+      const codeIndex = csvHeader.indexOf("code");
+      const nameIndex = csvHeader.indexOf("name");
+      const feeIndex = csvHeader.indexOf("fee");
+
+      csvDataRows.forEach((row) => {
+        const code = normalizeCountryCode(row[codeIndex >= 0 ? codeIndex : 0]);
+        const name = String(row[nameIndex >= 0 ? nameIndex : 1] ?? "").trim();
+        const fee = String(row[feeIndex >= 0 ? feeIndex : 4] ?? "").trim();
+        if (code) {
+          countryLookup.set(code, name || "?");
+          feeLookup.set(code, fee || "?");
+        }
+      });
+    } catch (err: unknown) {
+      shouldAugmentCountryData = false;
+      setError(
+        err instanceof Error
+          ? `${err.message} Export wird mit Originalwerten fortgesetzt.`
+          : "countries.csv konnte nicht geladen werden. Export wird mit Originalwerten fortgesetzt.",
+      );
+    }
+
+    const outputHeaders: string[] = [];
+    selectedColumnIndexes.forEach((item) => {
+      outputHeaders.push(item.header);
+      if (shouldAugmentCountryData && isNationalityColumn(item.header)) {
+        outputHeaders.push("Fee status");
+      }
+    });
+
+    const outputRows: Row[] = processedRows.map((row) => {
+      const next: Row = [];
+      selectedColumnIndexes.forEach((item, columnIndex) => {
+        const originalCell = row[columnIndex] ?? "";
+        if (item.header === "Studium") {
+          next.push(mapStudiumText(originalCell, studyNameLookup));
+        } else if (
+          shouldAugmentCountryData &&
+          shouldAnnotateCountryColumn(item.header)
+        ) {
+          const originalValue = String(originalCell);
+          const lookupCode = normalizeCountryCode(originalCell);
+          const lookedUpName = lookupCode
+            ? countryLookup.get(lookupCode)
+            : undefined;
+          next.push(`${originalValue} (${lookedUpName ?? "?"})`);
+        } else {
+          next.push(originalCell);
+        }
+
+        if (shouldAugmentCountryData && isNationalityColumn(item.header)) {
+          const lookupCode = normalizeCountryCode(originalCell);
+          const feeStatus = lookupCode ? feeLookup.get(lookupCode) : undefined;
+          next.push(feeStatus ?? "?");
+        }
+      });
+      return next;
+    });
+
+    const output: Row[] = [outputHeaders, ...outputRows];
 
     const worksheet = XLSX.utils.aoa_to_sheet(output);
     worksheet["!cols"] = buildColumnWidths(output);
     worksheet["!autofilter"] = {
       ref: XLSX.utils.encode_range({
         s: { r: 0, c: 0 },
-        e: { r: output.length - 1, c: selectedColumnIndexes.length - 1 },
+        e: { r: output.length - 1, c: outputHeaders.length - 1 },
       }),
     };
     const workbook = XLSX.utils.book_new();
@@ -324,21 +515,23 @@ export default function App() {
     headers.length > 0 &&
     selectedColumnIndexes.length > 0 &&
     (filterColumn === "" || selectedStudium.length > 0);
+  const missingFilterSelection =
+    headers.length > 0 && filterColumn !== "" && selectedStudium.length === 0;
 
   return (
     <div className="mx-auto flex w-full max-w-[1100px] flex-col gap-8 px-6 pb-20 pt-12">
       <header className="grid items-start gap-8 lg:grid-cols-[1.2fr_0.8fr]">
         <div>
           <p className="text-xs font-semibold uppercase tracking-[0.2em] text-accent-strong">
-            Nur im Browser
+            Alles lokal im Browser
           </p>
           <h1 className="mb-3 mt-2 text-[42px] font-semibold leading-tight">
             Studierendenliste filtern
           </h1>
           <p className="max-w-[520px] text-lg leading-relaxed text-muted">
             Excel-Datei hochladen, gewünschte Spalten behalten, nach Studium
-            filtern und die bereinigte Datei herunterladen. Alles bleibt in
-            deinem Browser.
+            filtern und die bereinigte Datei erzeugen. Alles bleibt auf dem
+            lokalen Computer.
           </p>
         </div>
         <div className="flex flex-col gap-3">
@@ -350,9 +543,9 @@ export default function App() {
               className="hidden"
             />
             <div>
-              <span className="block font-semibold">Excel-Datei auswählen</span>
+              <span className="block font-semibold">Excel-Datei laden</span>
               <span className="text-sm text-muted">
-                {fileName || "Keine Datei ausgewählt"}
+                {fileName || "Keine Datei geladen"}
               </span>
             </div>
           </label>
@@ -377,11 +570,10 @@ export default function App() {
             </div>
             <div className="grid gap-3 [grid-template-columns:repeat(auto-fit,minmax(160px,1fr))]">
               {headers.map((header) => (
+                // Columns that are usually not needed stay muted, while the label text signals caution.
                 <label
                   key={header}
-                  className={`flex items-center gap-2.5 rounded-full border border-border bg-[#fff8f2] px-3.5 py-2.5 text-sm${
-                    dimmedLookup.has(header.toLowerCase()) ? " opacity-55" : ""
-                  }`}
+                  className="flex items-center gap-2.5 rounded-full border border-border bg-[#fff8f2] px-3.5 py-2.5 text-sm"
                 >
                   <input
                     type="checkbox"
@@ -389,7 +581,15 @@ export default function App() {
                     onChange={() => toggleColumn(header)}
                     className="accent-accent"
                   />
-                  <span>{header}</span>
+                  <span
+                    className={
+                      dimmedLookup.has(header.toLowerCase())
+                        ? "text-warning-strong"
+                        : "text-text font-semibold"
+                    }
+                  >
+                    {header}
+                  </span>
                 </label>
               ))}
             </div>
@@ -398,32 +598,44 @@ export default function App() {
           <section className="rounded-[20px] border border-border bg-surface p-6 shadow-panel">
             <div className="mb-4 flex items-center justify-between gap-4">
               <h2 className="text-[22px] font-semibold">Studium-Filter</h2>
-              <div className="flex items-center gap-3 text-sm text-muted">
-                <span>Filterspalte</span>
-                <select
-                  value={filterColumn}
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    setFilterColumn(value);
-                    setSelectedStudium([]);
-                  }}
-                  className="rounded-xl border border-border px-3 py-2 font-sans text-sm"
-                >
-                  <option value="">Kein Filter</option>
-                  {headers
-                    .filter((header) => FILTERABLE_COLUMNS.includes(header))
-                    .map((header) => (
-                      <option key={header} value={header}>
-                        {header}
-                      </option>
-                    ))}
-                </select>
+              <div className="flex items-center gap-2 text-sm">
+                {["", "Studium", "Hörerstatus"].map((value) => {
+                  const isActive = filterColumn === value;
+                  const isAvailable =
+                    value === "" || availableFilterColumns.has(value);
+                  const label =
+                    value === ""
+                      ? "alle Studierenden"
+                      : value === "Studium"
+                        ? "nach Studium"
+                        : "nach Hörer*status";
+                  return (
+                    <button
+                      key={value || "none"}
+                      type="button"
+                      disabled={!isAvailable}
+                      onClick={() => {
+                        setFilterColumn(value);
+                        setSelectedStudium([]);
+                      }}
+                      className={`rounded-full border px-3 py-1.5 font-mono text-xs uppercase tracking-[0.08em] transition ${
+                        isActive
+                          ? "border-accent bg-accent text-white"
+                          : isAvailable
+                            ? "border-border bg-[#fff8f2] text-muted hover:border-accent hover:text-accent-strong"
+                            : "cursor-not-allowed border-border bg-[#f1e8de] text-[#9a8a78]"
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
               </div>
             </div>
             {filterColumn === "" ? (
               <p className="text-sm text-muted">
-                Keine Filterspalte ausgewählt. Wähle "Studium" oder
-                "Hörerstatus", um Zeilen zu filtern.
+                Keine Filterspalte ausgewählt, somit werden die Daten aller Studierenden exportiert. Wähle "Studium" oder
+                "Hörer*status", um Einträge zu filtern.
               </p>
             ) : (
               <div className="flex flex-col gap-2.5">
@@ -439,7 +651,9 @@ export default function App() {
                       className="accent-accent"
                     />
                     <span className="truncate">
-                      {String(value) || "(leer)"}
+                      {filterColumn === "Studium"
+                        ? mapStudiumText(value, studyNameLookup) || "(leer)"
+                        : String(value) || "(leer)"}
                     </span>
                     <span className="rounded-full bg-bgAccent px-2.5 py-1 font-mono text-xs text-accent-strong">
                       {studiumCounts.get(value) ?? 0}
@@ -450,14 +664,24 @@ export default function App() {
             )}
           </section>
 
-          <section className="flex flex-col gap-6 rounded-[20px] border border-border bg-surface p-6 shadow-panel lg:flex-row lg:items-center lg:justify-between">
+          <section className="flex flex-col gap-6 rounded-[20px] border border-border bg-surface p-6 shadow-panel lg:flex-row lg:items-start lg:justify-between">
             <div>
-              <h2 className="text-[22px] font-semibold">Vorschau</h2>
+              <h2 className="text-[22px] font-semibold">Export</h2>
               <p className="text-sm text-muted">
-                {processedRows.length} Zeilen nach Filterung und Spaltenauswahl.
+                {missingFilterSelection
+                  ? "Bitte wähle mindestens eine Filterkategorie zum Exportieren"
+                  : `${processedRows.length} Zeilen nach Filterung und Spaltenauswahl.`}
               </p>
             </div>
             <div className="flex w-full flex-col gap-4 md:w-[60%] lg:w-[45%]">
+              <button
+                type="button"
+                onClick={handleDownload}
+                disabled={!canDownload}
+                className="rounded-full bg-accent px-5 py-3 font-mono text-sm uppercase tracking-[0.12em] text-white transition hover:-translate-y-0.5 hover:bg-accent-strong disabled:cursor-not-allowed disabled:bg-[#d5b5ad] disabled:hover:translate-y-0"
+              >
+                Gefilterte Excel-Datei herunterladen
+              </button>
               <div className="flex flex-col gap-1 text-sm text-muted">
                 <label className="flex items-center gap-2">
                   <span>Exportmodus</span>
@@ -482,14 +706,6 @@ export default function App() {
                     : "Studierende mit Mehrfachstudien bleiben als separate Einträge erhalten; Matrikelnummer wird durch eine Zufalls-ID ersetzt."}
                 </span>
               </div>
-              <button
-                type="button"
-                onClick={handleDownload}
-                disabled={!canDownload}
-                className="rounded-full bg-accent px-5 py-3 font-mono text-sm uppercase tracking-[0.12em] text-white transition hover:-translate-y-0.5 hover:bg-accent-strong disabled:cursor-not-allowed disabled:bg-[#d5b5ad] disabled:hover:translate-y-0"
-              >
-                Gefilterte Excel-Datei herunterladen
-              </button>
             </div>
           </section>
         </main>

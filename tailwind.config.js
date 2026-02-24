@@ -11,6 +11,8 @@ export default {
         muted: "#5a4c3b",
         accent: "#c8553d",
         "accent-strong": "#8f3524",
+        warning: "#fff2dc",
+        "warning-strong": "#ff0000",
         border: "#e3d2c0",
       },
       boxShadow: {
