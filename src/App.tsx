@@ -1,9 +1,17 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ChangeEvent } from "react";
-import * as XLSX from "xlsx";
+import type { Worksheet } from "exceljs";
 
 const DEFAULT_FILTER_COLUMN = "Studium";
 const FILTERABLE_COLUMNS = ["Hörerstatus", "Studium"];
+const PRESUMED_FEE_STATUS_HEADER =
+  "presumed fee status (based on OECD 2025 list)";
+const FEE_STATUS_LABELS: Record<string, string> = {
+  exempt: "exempt (until exceeding tolerance semesters)",
+  refund: "double fee, full refund",
+  partial: "double fee, 50% refund",
+  double: "double fee",
+};
 const DIMMED_COLUMNS = [
   "Titel vor",
   "Titel nach",
@@ -63,6 +71,11 @@ function normalizeCountryCode(value: Cell) {
   return String(value ?? "").trim().toUpperCase();
 }
 
+function toPrettyFeeStatus(value: string) {
+  const normalized = value.trim().toLowerCase();
+  return FEE_STATUS_LABELS[normalized] ?? value;
+}
+
 function getBaseUrl() {
   return import.meta.env.BASE_URL.endsWith("/")
     ? import.meta.env.BASE_URL
@@ -90,6 +103,120 @@ function mapStudiumText(value: Cell, lookup: Map<string, string>) {
     .join(", ");
 }
 
+function mapStudiumTextWithMeta(value: Cell, lookup: Map<string, string>) {
+  const raw = String(value ?? "");
+  if (!raw.trim()) {
+    return { text: raw, usedLookup: false };
+  }
+
+  let usedLookup = false;
+  const text = raw
+    .split(",")
+    .map((part) => {
+      const key = part.trim();
+      if (!key) return "";
+      if (lookup.has(key)) {
+        usedLookup = true;
+      }
+      return lookup.get(key) ?? key;
+    })
+    .filter((part) => part.length > 0)
+    .join(", ");
+
+  return { text, usedLookup };
+}
+
+function parseCsvRows(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let value = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          value += '"';
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        value += ch;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inQuotes = true;
+      continue;
+    }
+    if (ch === ",") {
+      row.push(value);
+      value = "";
+      continue;
+    }
+    if (ch === "\n") {
+      row.push(value);
+      rows.push(row);
+      row = [];
+      value = "";
+      continue;
+    }
+    if (ch !== "\r") {
+      value += ch;
+    }
+  }
+
+  row.push(value);
+  rows.push(row);
+  return rows.filter((entry) => entry.some((cell) => String(cell).length > 0));
+}
+
+function toPrimitiveCellValue(value: unknown, fallbackText: string): Cell {
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+  if (value instanceof Date) return fallbackText || value.toISOString();
+  if (value && typeof value === "object" && "result" in value) {
+    const result = (value as { result?: unknown }).result;
+    if (
+      typeof result === "string" ||
+      typeof result === "number" ||
+      typeof result === "boolean"
+    ) {
+      return result;
+    }
+  }
+  return fallbackText;
+}
+
+function setWorksheetCellItalic(
+  worksheet: Worksheet,
+  rowIndex1: number,
+  columnIndex1: number,
+) {
+  const cell = worksheet.getCell(rowIndex1, columnIndex1);
+  cell.font = {
+    ...(cell.font ?? {}),
+    italic: true,
+  };
+}
+
+let excelJsPromise: Promise<typeof import("exceljs")> | null = null;
+
+async function loadExcelJs() {
+  if (!excelJsPromise) {
+    excelJsPromise = import("exceljs");
+  }
+  return excelJsPromise;
+}
+
 export default function App() {
   const [fileName, setFileName] = useState("");
   const [headers, setHeaders] = useState<string[]>([]);
@@ -115,13 +242,7 @@ export default function App() {
         if (!response.ok) return;
 
         const csvText = await response.text();
-        const workbook = XLSX.read(csvText, { type: "string" });
-        const sheet = workbook.Sheets[workbook.SheetNames[0]];
-        const csvRows = XLSX.utils.sheet_to_json(sheet, {
-          header: 1,
-          defval: "",
-          blankrows: false,
-        }) as Cell[][];
+        const csvRows = parseCsvRows(csvText);
 
         const [headerRow, ...dataRows] = csvRows;
         const csvHeader = (headerRow ?? []).map((value) =>
@@ -219,29 +340,14 @@ export default function App() {
   }, [filteredRows, selectedColumnIndexes]);
 
   const uniqueTrimmedRows = useMemo(() => {
-    if (trimmedRows.length === 0) return [];
-    const studiumIndex = selectedColumnIndexes.findIndex(
-      (item) => item.header === "Studium",
-    );
-    if (studiumIndex < 0) {
-      const seen = new Set<string>();
-      const deduped: Row[] = [];
-      trimmedRows.forEach((row) => {
-        const key = JSON.stringify(row.map((cell) => String(cell ?? "")));
-        if (!seen.has(key)) {
-          seen.add(key);
-          deduped.push(row);
-        }
-      });
-      return deduped;
-    }
-
+    if (selectedColumnIndexes.length === 0 || filteredRows.length === 0) return [];
+    const studiumFullIndex = headers.findIndex((header) => header === "Studium");
     const merged = new Map<string, { row: Row; values: Set<string> }>();
     const order: string[] = [];
-    trimmedRows.forEach((row) => {
-      const keyParts = row.map((cell, index) => {
-        if (index === studiumIndex) return "";
-        return String(cell ?? "");
+    filteredRows.forEach((row) => {
+      const keyParts = headers.map((_, index) => {
+        if (index === studiumFullIndex) return "";
+        return String(row[index] ?? "");
       });
       const key = JSON.stringify(keyParts);
       if (!merged.has(key)) {
@@ -253,17 +359,25 @@ export default function App() {
       }
       const entry = merged.get(key);
       if (entry) {
-        entry.values.add(String(row[studiumIndex] ?? "").trim());
+        entry.values.add(
+          studiumFullIndex >= 0 ? String(row[studiumFullIndex] ?? "").trim() : "",
+        );
       }
     });
 
     return order.map((key) => {
       const entry = merged.get(key)!;
-      const values = Array.from(entry.values).filter((value) => value.length);
-      entry.row[studiumIndex] = values.join(", ");
-      return entry.row;
+      const mergedStudium = Array.from(entry.values)
+        .filter((value) => value.length)
+        .join(", ");
+      return selectedColumnIndexes.map((item) => {
+        if (item.header === "Studium" && studiumFullIndex >= 0) {
+          return mergedStudium;
+        }
+        return entry.row[item.index] ?? "";
+      });
     });
-  }, [trimmedRows, selectedColumnIndexes]);
+  }, [selectedColumnIndexes, filteredRows, headers]);
 
   const processedRows = useMemo(() => {
     const baseRows = exportMode === "student" ? uniqueTrimmedRows : trimmedRows;
@@ -311,14 +425,22 @@ export default function App() {
 
     try {
       const buffer = await file.arrayBuffer();
-      const workbook = XLSX.read(buffer, { type: "array" });
-      const sheetName = workbook.SheetNames[0];
-      const worksheet = workbook.Sheets[sheetName];
-      const data = XLSX.utils.sheet_to_json(worksheet, {
-        header: 1,
-        defval: "",
-        blankrows: false,
-      }) as Cell[][];
+      const { default: ExcelJS } = await loadExcelJs();
+      const workbook = new ExcelJS.Workbook();
+      await workbook.xlsx.load(buffer);
+      const worksheet = workbook.worksheets[0];
+      if (!worksheet) {
+        throw new Error("The sheet is empty.");
+      }
+      const data: Cell[][] = [];
+      worksheet.eachRow({ includeEmpty: false }, (excelRow) => {
+        const rowValues: Cell[] = [];
+        for (let colIndex = 1; colIndex <= excelRow.cellCount; colIndex += 1) {
+          const cell = excelRow.getCell(colIndex);
+          rowValues.push(toPrimitiveCellValue(cell.value, cell.text ?? ""));
+        }
+        data.push(rowValues);
+      });
 
       if (!data || data.length === 0) {
         throw new Error("The sheet is empty.");
@@ -423,13 +545,7 @@ export default function App() {
         throw new Error(`countries.csv could not be loaded (${response.status}).`);
       }
       const csvText = await response.text();
-      const csvWorkbook = XLSX.read(csvText, { type: "string" });
-      const csvSheet = csvWorkbook.Sheets[csvWorkbook.SheetNames[0]];
-      const csvRows = XLSX.utils.sheet_to_json(csvSheet, {
-        header: 1,
-        defval: "",
-        blankrows: false,
-      }) as Cell[][];
+      const csvRows = parseCsvRows(csvText);
 
       const [csvHeaderRow, ...csvDataRows] = csvRows;
       const csvHeader = (csvHeaderRow ?? []).map((value) =>
@@ -442,7 +558,8 @@ export default function App() {
       csvDataRows.forEach((row) => {
         const code = normalizeCountryCode(row[codeIndex >= 0 ? codeIndex : 0]);
         const name = String(row[nameIndex >= 0 ? nameIndex : 1] ?? "").trim();
-        const fee = String(row[feeIndex >= 0 ? feeIndex : 4] ?? "").trim();
+        const feeRaw = String(row[feeIndex >= 0 ? feeIndex : 4] ?? "").trim();
+        const fee = toPrettyFeeStatus(feeRaw);
         if (code) {
           countryLookup.set(code, name || "?");
           feeLookup.set(code, fee || "?");
@@ -458,19 +575,35 @@ export default function App() {
     }
 
     const outputHeaders: string[] = [];
+    const italicHeaderColumns = new Set<number>();
     selectedColumnIndexes.forEach((item) => {
       outputHeaders.push(item.header);
       if (shouldAugmentCountryData && isNationalityColumn(item.header)) {
-        outputHeaders.push("Fee status");
+        outputHeaders.push(PRESUMED_FEE_STATUS_HEADER);
+        italicHeaderColumns.add(outputHeaders.length - 1);
       }
     });
 
-    const outputRows: Row[] = processedRows.map((row) => {
+    const countryAnnotatedCells = new Map<
+      string,
+      { originalValue: string; lookedUpName: string }
+    >();
+    const outputCellItalics: boolean[][] = [];
+    const outputRows: Row[] = processedRows.map((row, rowIndex) => {
       const next: Row = [];
+      const italicFlags: boolean[] = [];
       selectedColumnIndexes.forEach((item, columnIndex) => {
         const originalCell = row[columnIndex] ?? "";
+        let renderedCell: Cell = originalCell;
+        let shouldItalicCell = false;
+
         if (item.header === "Studium") {
-          next.push(mapStudiumText(originalCell, studyNameLookup));
+          const mappedStudium = mapStudiumTextWithMeta(
+            originalCell,
+            studyNameLookup,
+          );
+          renderedCell = mappedStudium.text;
+          shouldItalicCell = mappedStudium.usedLookup;
         } else if (
           shouldAugmentCountryData &&
           shouldAnnotateCountryColumn(item.header)
@@ -480,35 +613,81 @@ export default function App() {
           const lookedUpName = lookupCode
             ? countryLookup.get(lookupCode)
             : undefined;
-          next.push(`${originalValue} (${lookedUpName ?? "?"})`);
-        } else {
-          next.push(originalCell);
+          renderedCell = `${originalValue} (${lookedUpName ?? "?"})`;
+          const outputColumnIndex = next.length;
+          countryAnnotatedCells.set(`${rowIndex}:${outputColumnIndex}`, {
+            originalValue,
+            lookedUpName: lookedUpName ?? "?",
+          });
         }
+
+        if (exportMode === "statistics" && item.header === "Matrikelnummer") {
+          shouldItalicCell = true;
+        }
+        next.push(renderedCell);
+        italicFlags.push(shouldItalicCell);
 
         if (shouldAugmentCountryData && isNationalityColumn(item.header)) {
           const lookupCode = normalizeCountryCode(originalCell);
           const feeStatus = lookupCode ? feeLookup.get(lookupCode) : undefined;
           next.push(feeStatus ?? "?");
+          italicFlags.push(true);
         }
       });
+      outputCellItalics.push(italicFlags);
       return next;
     });
 
     const output: Row[] = [outputHeaders, ...outputRows];
-
-    const worksheet = XLSX.utils.aoa_to_sheet(output);
-    worksheet["!cols"] = buildColumnWidths(output);
-    worksheet["!autofilter"] = {
-      ref: XLSX.utils.encode_range({
-        s: { r: 0, c: 0 },
-        e: { r: output.length - 1, c: outputHeaders.length - 1 },
-      }),
+    const { default: ExcelJS } = await loadExcelJs();
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Filtered");
+    worksheet.addRow(outputHeaders);
+    outputRows.forEach((row) => {
+      worksheet.addRow(row.map((cell) => (cell === null ? "" : cell)));
+    });
+    italicHeaderColumns.forEach((columnIndex) => {
+      setWorksheetCellItalic(worksheet, 1, columnIndex + 1);
+    });
+    outputCellItalics.forEach((rowItalics, rowIndex) => {
+      rowItalics.forEach((shouldItalicCell, columnIndex) => {
+        if (shouldItalicCell) {
+          setWorksheetCellItalic(worksheet, rowIndex + 2, columnIndex + 1);
+        }
+      });
+    });
+    countryAnnotatedCells.forEach((parts, key) => {
+      const [rowIndexText, columnIndexText] = key.split(":");
+      const rowIndex = Number(rowIndexText);
+      const columnIndex = Number(columnIndexText);
+      const cell = worksheet.getCell(rowIndex + 2, columnIndex + 1);
+      cell.value = {
+        richText: [
+          { text: `${parts.originalValue} (` },
+          { text: parts.lookedUpName, font: { italic: true } },
+          { text: ")" },
+        ],
+      };
+    });
+    const columnWidths = buildColumnWidths(output);
+    columnWidths.forEach((entry, index) => {
+      worksheet.getColumn(index + 1).width = entry.wch;
+    });
+    worksheet.autoFilter = {
+      from: { row: 1, column: 1 },
+      to: { row: output.length, column: outputHeaders.length },
     };
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, "Filtered");
 
     const baseName = fileName ? fileName.replace(/\.xlsx$/i, "") : "output";
-    XLSX.writeFile(workbook, `${baseName}-filtered.xlsx`);
+    const buffer = await workbook.xlsx.writeBuffer();
+    const blob = new Blob([buffer], {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `${baseName}-filtered.xlsx`;
+    link.click();
+    URL.revokeObjectURL(link.href);
   }
 
   const canDownload =
