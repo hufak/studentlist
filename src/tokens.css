@@ -1,0 +1,38 @@
+/* Every value the app paints with is a Nextcloud token with a standalone
+ * fallback: embedded, the host injects the real values and the app adopts the
+ * instance theme (including dark mode); standalone, the fallbacks apply. */
+:root {
+	--sl-background: var(--color-main-background, #ffffff);
+	--sl-page-background: var(--color-main-background, #f4efe9);
+	--sl-text: var(--color-main-text, #1e1b16);
+	--sl-text-muted: var(--color-text-maxcontrast, #5a4c3b);
+	--sl-hover: var(--color-background-hover, #fff8f2);
+	--sl-border: var(--color-border, #e3d2c0);
+	--sl-accent: var(--color-primary-element, #c8553d);
+	--sl-accent-text: var(--color-primary-element-text, #ffffff);
+	--sl-error: var(--color-error, #8f3524);
+	--sl-warning: var(--color-warning, #b35c00);
+	--sl-radius: var(--border-radius-element, 8px);
+	--sl-clickable: var(--default-clickable-area, 44px);
+	--sl-font: var(--font-face, "Space Grotesk", system-ui, sans-serif);
+
+	color-scheme: light dark;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	min-height: 100vh;
+	background: var(--sl-page-background);
+	color: var(--sl-text);
+	font-family: var(--sl-font);
+}
+
+/* embedded, the host page already provides the page chrome */
+:root[data-embed='1'] body {
+	min-height: 0;
+	background: transparent;
+}
