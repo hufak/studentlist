@@ -4,6 +4,11 @@ import type { Row as ExcelRow, Worksheet } from 'exceljs';
 
 const DEFAULT_FILTER_COLUMN = 'Studium';
 const FILTERABLE_COLUMNS = ['Hörerstatus', 'Studium'];
+// Not a spreadsheet column: derived from the Studium column via the study details lookup.
+const STV_FILTER = '__stv__';
+const NO_STV = '';
+// Drives the generated StV level suffixes, e.g. "Restaurierung+CHC (Diplom+MA)".
+const STUDY_LEVEL_ORDER = ['Diplom', 'BA', 'MA', 'PhD'];
 const PRESUMED_FEE_STATUS_HEADER = 'presumed fee status (based on OECD 2025 list)';
 const FEE_STATUS_LABELS: Record<string, string> = {
 	exempt: 'exempt (until exceeding tolerance semesters)',
@@ -25,6 +30,7 @@ const DIMMED_COLUMNS = [
 const FILTER_MODES = [
 	{ value: '', label: 'alle Studierenden' },
 	{ value: 'Studium', label: 'nach Studium' },
+	{ value: STV_FILTER, label: 'nach StV' },
 	{ value: 'Hörerstatus', label: 'nach Hörer*status' },
 ];
 
@@ -93,17 +99,30 @@ function formatStudyPrettyName(name: string, level: string) {
 	return `${cleanName} (${cleanLevel})`;
 }
 
+function sortStudyLevels(levels: Iterable<string>) {
+	return Array.from(levels).sort((left, right) => {
+		const leftRank = STUDY_LEVEL_ORDER.indexOf(left);
+		const rightRank = STUDY_LEVEL_ORDER.indexOf(right);
+		// Levels the order does not know about trail the known ones, alphabetically.
+		if (leftRank < 0 && rightRank < 0) return left.localeCompare(right, 'de');
+		if (leftRank < 0) return 1;
+		if (rightRank < 0) return -1;
+		return leftRank - rightRank;
+	});
+}
+
+function splitStudiumKeys(value: Cell) {
+	return String(value ?? '')
+		.split(',')
+		.map((part) => part.trim())
+		.filter((part) => part.length > 0);
+}
+
 function mapStudiumText(value: Cell, lookup: Map<string, string>) {
 	const raw = String(value ?? '');
 	if (!raw.trim()) return raw;
-	return raw
-		.split(',')
-		.map((part) => {
-			const key = part.trim();
-			if (!key) return '';
-			return lookup.get(key) ?? key;
-		})
-		.filter((part) => part.length > 0)
+	return splitStudiumKeys(raw)
+		.map((key) => lookup.get(key) ?? key)
 		.join(', ');
 }
 
@@ -218,24 +237,34 @@ const selectedStudium = ref<string[]>([]);
 const error = ref('');
 const exportMode = ref<'student' | 'statistics'>('student');
 const studyNameLookup = ref<Map<string, string>>(new Map());
+const stvLookup = ref<Map<string, string>>(new Map());
+const stvLabelLookup = ref<Map<string, string>>(new Map());
 
 const dimmedLookup = new Set(DIMMED_COLUMNS.map((name) => name.toLowerCase()));
 
-onMounted(async () => {
-	try {
-		const response = await fetch(`${getBaseUrl()}study_names.csv`, { cache: 'no-store' });
-		if (!response.ok) return;
+async function fetchCsvRows(fileName: string) {
+	const response = await fetch(`${getBaseUrl()}${fileName}`, { cache: 'no-store' });
+	if (!response.ok) return null;
 
-		const csvRows = parseCsvRows(await response.text());
-		const [headerRow, ...dataRows] = csvRows;
-		const csvHeader = (headerRow ?? []).map((value) => String(value ?? '').trim().toLowerCase());
-		const dnameIndex = csvHeader.indexOf('dname');
-		const nameIndex = csvHeader.indexOf('name');
-		const levelIndex = csvHeader.indexOf('level');
+	const csvRows = parseCsvRows(await response.text());
+	const [headerRow, ...dataRows] = csvRows;
+	const csvHeader = (headerRow ?? []).map((value) => String(value ?? '').trim().toLowerCase());
+	return { csvHeader, dataRows };
+}
+
+// Maps the spreadsheet's Studium values onto pretty study names ("name (level)").
+async function loadStudyNameLookup() {
+	try {
+		const csv = await fetchCsvRows('angewandte_evidenz_study_name_lookup.csv');
+		if (!csv) return;
+
+		const dnameIndex = csv.csvHeader.indexOf('dname');
+		const nameIndex = csv.csvHeader.indexOf('name');
+		const levelIndex = csv.csvHeader.indexOf('level');
 		if (dnameIndex < 0 || nameIndex < 0 || levelIndex < 0) return;
 
 		const nextLookup = new Map<string, string>();
-		dataRows.forEach((row) => {
+		csv.dataRows.forEach((row) => {
 			const dname = String(row[dnameIndex] ?? '').trim();
 			const name = String(row[nameIndex] ?? '').trim();
 			const level = String(row[levelIndex] ?? '').trim();
@@ -248,16 +277,96 @@ onMounted(async () => {
 	} catch {
 		studyNameLookup.value = new Map();
 	}
+}
+
+// Maps pretty study names onto the StV responsible for them, and derives each StV's
+// display label from the levels of the degrees it covers, e.g. "TransArts (BA+MA)".
+async function loadStvLookup() {
+	try {
+		const csv = await fetchCsvRows('angewandte_study_details.csv');
+		if (!csv) return;
+
+		const nameIndex = csv.csvHeader.indexOf('name');
+		const levelIndex = csv.csvHeader.indexOf('level');
+		const stvIndex = csv.csvHeader.indexOf('stv');
+		if (nameIndex < 0 || levelIndex < 0 || stvIndex < 0) return;
+
+		const nextLookup = new Map<string, string>();
+		const levelsByStv = new Map<string, Set<string>>();
+		csv.dataRows.forEach((row) => {
+			const name = String(row[nameIndex] ?? '').trim();
+			const level = String(row[levelIndex] ?? '').trim();
+			const stv = String(row[stvIndex] ?? '').trim();
+			const pretty = formatStudyPrettyName(name, level);
+			if (pretty && stv) {
+				nextLookup.set(pretty, stv);
+				const levels = levelsByStv.get(stv) ?? new Set<string>();
+				levels.add(level);
+				levelsByStv.set(stv, levels);
+			}
+		});
+
+		const nextLabels = new Map<string, string>();
+		levelsByStv.forEach((levels, stv) => {
+			nextLabels.set(stv, `${stv} (${sortStudyLevels(levels).join('+')})`);
+		});
+
+		stvLookup.value = nextLookup;
+		stvLabelLookup.value = nextLabels;
+	} catch {
+		stvLookup.value = new Map();
+		stvLabelLookup.value = new Map();
+	}
+}
+
+onMounted(() => {
+	void loadStudyNameLookup();
+	void loadStvLookup();
 });
 
-const columnIndex = computed(() =>
-	filterColumn.value ? headers.value.indexOf(filterColumn.value) : -1,
-);
+const isStvMode = computed(() => filterColumn.value === STV_FILTER);
+
+const studiumColumnIndex = computed(() => headers.value.indexOf('Studium'));
+
+const columnIndex = computed(() => {
+	if (isStvMode.value) return studiumColumnIndex.value;
+	return filterColumn.value ? headers.value.indexOf(filterColumn.value) : -1;
+});
 
 const availableFilterColumns = computed(() => new Set(headers.value));
 
+function isFilterModeAvailable(mode: string) {
+	if (mode === '') return true;
+	if (mode === STV_FILTER) return studiumColumnIndex.value >= 0 && stvLookup.value.size > 0;
+	return availableFilterColumns.value.has(mode);
+}
+
+// The StVs each row belongs to; a student with multiple studies can belong to several.
+const rowStvs = computed(() => {
+	if (!isStvMode.value || columnIndex.value < 0) return [];
+	return rows.value.map((row) => {
+		const keys = splitStudiumKeys(row[columnIndex.value]);
+		if (keys.length === 0) return [NO_STV];
+		return unique(
+			keys.map((key) => {
+				const pretty = studyNameLookup.value.get(key) ?? key;
+				return stvLookup.value.get(pretty) ?? NO_STV;
+			}),
+		);
+	});
+});
+
 const studiumOptions = computed(() => {
 	if (columnIndex.value < 0) return [];
+	if (isStvMode.value) {
+		return unique(rowStvs.value.flat()).sort((left, right) => {
+			if (left === NO_STV) return 1;
+			if (right === NO_STV) return -1;
+			return filterOptionLabel(left).localeCompare(filterOptionLabel(right), 'de', {
+				sensitivity: 'base',
+			});
+		});
+	}
 	const values = unique(rows.value.map((row) => String(row[columnIndex.value] ?? '')));
 	if (filterColumn.value !== 'Studium') {
 		return values.sort();
@@ -274,6 +383,12 @@ const studiumOptions = computed(() => {
 const studiumCounts = computed(() => {
 	const counts = new Map<string, number>();
 	if (columnIndex.value < 0) return counts;
+	if (isStvMode.value) {
+		rowStvs.value.forEach((stvs) => {
+			stvs.forEach((stv) => counts.set(stv, (counts.get(stv) ?? 0) + 1));
+		});
+		return counts;
+	}
 	rows.value.forEach((row) => {
 		const value = String(row[columnIndex.value] ?? '');
 		counts.set(value, (counts.get(value) ?? 0) + 1);
@@ -285,6 +400,11 @@ const filteredRows = computed(() => {
 	if (rows.value.length === 0) return [];
 	if (columnIndex.value < 0 || selectedStudium.value.length === 0) return rows.value;
 	const allowed = new Set(selectedStudium.value);
+	if (isStvMode.value) {
+		return rows.value.filter((_, index) =>
+			(rowStvs.value[index] ?? []).some((stv) => allowed.has(stv)),
+		);
+	}
 	return rows.value.filter((row) => allowed.has(String(row[columnIndex.value] ?? '')));
 });
 
@@ -482,6 +602,17 @@ function toggleStudium(value: string) {
 
 function selectAllColumns(event: Event) {
 	selectedColumns.value = (event.target as HTMLInputElement).checked ? [...headers.value] : [];
+}
+
+function filterOptionLabel(value: string) {
+	if (isStvMode.value) {
+		if (!value) return '(keine StV)';
+		return stvLabelLookup.value.get(value) ?? value;
+	}
+	if (filterColumn.value === 'Studium') {
+		return mapStudiumText(value, studyNameLookup.value) || '(leer)';
+	}
+	return value || '(leer)';
 }
 
 function selectFilterColumn(value: string) {
@@ -685,7 +816,7 @@ async function handleDownload() {
 							v-for="mode in FILTER_MODES"
 							:key="mode.value || 'none'"
 							type="button"
-							:disabled="mode.value !== '' && !availableFilterColumns.has(mode.value)"
+							:disabled="!isFilterModeAvailable(mode.value)"
 							:class="['mode-button', { 'mode-button--active': filterColumn === mode.value }]"
 							@click="selectFilterColumn(mode.value)">
 							{{ mode.label }}
@@ -693,20 +824,20 @@ async function handleDownload() {
 					</div>
 				</div>
 				<p v-if="filterColumn === ''" class="muted">
-					Keine Filterspalte ausgewählt, somit werden die Daten aller Studierenden
-					exportiert. Wähle "Studium" oder "Hörer*status", um Einträge zu filtern.
+					Kein Filter ausgewählt, somit werden die Daten aller Studierenden
+					exportiert. Wähle "Studium", "StV" oder "Hörer*status", um Einträge zu filtern.
 				</p>
 				<div v-else class="option-list">
+					<p v-if="isStvMode" class="muted">
+						Exportiert alle Studierenden, deren Studium laut Studiendaten der gewählten StV
+						zugeordnet ist. Mehrfachstudien zählen zu jeder betroffenen StV.
+					</p>
 					<label v-for="value in studiumOptions" :key="String(value)" class="option">
 						<input
 							type="checkbox"
 							:checked="selectedStudium.includes(value)"
 							@change="toggleStudium(value)">
-						<span class="option-label">
-							{{ filterColumn === 'Studium'
-								? mapStudiumText(value, studyNameLookup) || '(leer)'
-								: String(value) || '(leer)' }}
-						</span>
+						<span class="option-label">{{ filterOptionLabel(value) }}</span>
 						<span class="count">{{ studiumCounts.get(value) ?? 0 }}</span>
 					</label>
 				</div>
