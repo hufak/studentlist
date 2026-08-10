@@ -335,6 +335,18 @@ const columnIndex = computed(() => {
 
 const availableFilterColumns = computed(() => new Set(headers.value));
 
+/** Identifies the student behind an enrolment row: the sheet holds one row per
+ * enrolment, so one student's several studies differ only in the Studium column.
+ * The student-centred export merges on this, and the StV counts count it, so a
+ * count always matches the number of entries that selecting it exports. */
+function studentIdentity(row: Row) {
+	return JSON.stringify(
+		headers.value.map((_, index) =>
+			index === studiumColumnIndex.value ? '' : String(row[index] ?? ''),
+		),
+	);
+}
+
 function isFilterModeAvailable(mode: string) {
 	if (mode === '') return true;
 	if (mode === STV_FILTER) return studiumColumnIndex.value >= 0 && stvLookup.value.size > 0;
@@ -384,9 +396,17 @@ const studiumCounts = computed(() => {
 	const counts = new Map<string, number>();
 	if (columnIndex.value < 0) return counts;
 	if (isStvMode.value) {
-		rowStvs.value.forEach((stvs) => {
-			stvs.forEach((stv) => counts.set(stv, (counts.get(stv) ?? 0) + 1));
+		// Students, not enrolments: several studies of one student can share an StV.
+		const studentsByStv = new Map<string, Set<string>>();
+		rows.value.forEach((row, index) => {
+			const student = studentIdentity(row);
+			(rowStvs.value[index] ?? []).forEach((stv) => {
+				const students = studentsByStv.get(stv) ?? new Set<string>();
+				students.add(student);
+				studentsByStv.set(stv, students);
+			});
 		});
+		studentsByStv.forEach((students, stv) => counts.set(stv, students.size));
 		return counts;
 	}
 	rows.value.forEach((row) => {
@@ -424,15 +444,11 @@ const trimmedRows = computed(() => {
 
 const uniqueTrimmedRows = computed(() => {
 	if (selectedColumnIndexes.value.length === 0 || filteredRows.value.length === 0) return [];
-	const studiumFullIndex = headers.value.findIndex((header) => header === 'Studium');
+	const studiumFullIndex = studiumColumnIndex.value;
 	const merged = new Map<string, { row: Row; values: Set<string> }>();
 	const order: string[] = [];
 	filteredRows.value.forEach((row) => {
-		const keyParts = headers.value.map((_, index) => {
-			if (index === studiumFullIndex) return '';
-			return String(row[index] ?? '');
-		});
-		const key = JSON.stringify(keyParts);
+		const key = studentIdentity(row);
 		if (!merged.has(key)) {
 			merged.set(key, { row: row.map((cell) => cell ?? ''), values: new Set() });
 			order.push(key);
