@@ -770,10 +770,10 @@ async function handleDownload() {
 		<header class="hero">
 			<div class="hero-intro">
 				<p class="eyebrow">Alles lokal im Browser</p>
-				<h1>Studierendenliste filtern</h1>
+				<h1>Studierendenevidenz filtern</h1>
 				<p class="lead">
-					Excel-Datei hochladen, gewünschte Spalten behalten, nach Studium filtern und die
-					bereinigte Datei erzeugen. Alles bleibt auf dem lokalen Computer.
+					Excel-Datei hochladen, gewünschte Spalten behalten, nach Studien oder StV filtern und die
+					bereinigte Datei erzeugen. Alle Daten bleiben lokal auf dem Computer.
 				</p>
 			</div>
 			<div class="hero-upload">
@@ -1041,8 +1041,9 @@ h2 {
 	font-weight: 600;
 }
 
+/* Dispreferred, not dangerous: these columns are merely discouraged from export. */
 .chip-dimmed {
-	color: var(--sl-warning);
+	color: var(--sl-text-muted);
 }
 
 .option-list {

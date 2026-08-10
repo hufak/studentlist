@@ -1,17 +1,24 @@
 /* Every value the app paints with is a Nextcloud token with a standalone
  * fallback: embedded, the host injects the real values and the app adopts the
- * instance theme (including dark mode); standalone, the fallbacks apply. */
+ * instance theme (including dark mode); standalone, the fallbacks apply.
+ *
+ * The fallbacks are Nextcloud's own default theme values (apps/theming
+ * DefaultTheme.php), so an unthemed standalone page looks like an untouched
+ * Nextcloud rather than carrying a palette of its own. The greys are what
+ * Nextcloud derives from a white background: darken(#fff, 4/7/14). */
 :root {
 	--sl-background: var(--color-main-background, #ffffff);
-	--sl-page-background: var(--color-main-background, #f4efe9);
-	--sl-text: var(--color-main-text, #1e1b16);
-	--sl-text-muted: var(--color-text-maxcontrast, #5a4c3b);
-	--sl-hover: var(--color-background-hover, #fff8f2);
-	--sl-border: var(--color-border, #e3d2c0);
-	--sl-accent: var(--color-primary-element, #c8553d);
+	--sl-page-background: var(--color-background-dark, #ededed);
+	--sl-text: var(--color-main-text, #222222);
+	--sl-text-muted: var(--color-text-maxcontrast, #6b6b6b);
+	--sl-hover: var(--color-background-hover, #f5f5f5);
+	--sl-border: var(--color-border, #ededed);
+	--sl-accent: var(--color-primary-element, #00679e);
 	--sl-accent-text: var(--color-primary-element-text, #ffffff);
-	--sl-error: var(--color-error, #8f3524);
-	--sl-warning: var(--color-warning, #b35c00);
+	/* --color-error is a pale background tint in current Nextcloud, so reading it
+	 * as a text colour renders near-invisible; --color-error-text is the readable
+	 * one, with --color-error kept as the pre-27 spelling. */
+	--sl-error: var(--color-error-text, var(--color-error, #8a0000));
 	--sl-radius: var(--border-radius-element, 8px);
 	--sl-clickable: var(--default-clickable-area, 44px);
 	--sl-font: var(--font-face, "Space Grotesk", system-ui, sans-serif);
