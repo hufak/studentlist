@@ -2,8 +2,6 @@
 import { computed, onMounted, ref } from 'vue';
 import type { Row as ExcelRow, Worksheet } from 'exceljs';
 
-const DEFAULT_FILTER_COLUMN = 'Studium';
-const FILTERABLE_COLUMNS = ['Hörerstatus', 'Studium'];
 // Not a spreadsheet column: derived from the Studium column via the study details lookup.
 const STV_FILTER = '__stv__';
 const NO_STV = '';
@@ -27,10 +25,12 @@ const DIMMED_COLUMNS = [
 	'Studien_Ort',
 	'Studien_Straße',
 ];
+// Order matters twice: the buttons render in it, and the first available mode
+// past "alle Studierenden" becomes the default once a sheet is loaded.
 const FILTER_MODES = [
 	{ value: '', label: 'alle Studierenden' },
-	{ value: 'Studium', label: 'nach Studium' },
 	{ value: STV_FILTER, label: 'nach StV' },
+	{ value: 'Studium', label: 'nach Studium' },
 	{ value: 'Hörerstatus', label: 'nach Hörer*status' },
 ];
 
@@ -585,9 +585,9 @@ async function handleFileChange(event: Event) {
 		);
 		selectedColumns.value = defaultSelected.length > 0 ? defaultSelected : [];
 
-		filterColumn.value = cleanHeaders.includes(DEFAULT_FILTER_COLUMN)
-			? DEFAULT_FILTER_COLUMN
-			: FILTERABLE_COLUMNS.find((column) => cleanHeaders.includes(column)) || '';
+		filterColumn.value =
+			FILTER_MODES.find((mode) => mode.value !== '' && isFilterModeAvailable(mode.value))
+				?.value ?? '';
 		selectedStudium.value = [];
 	} catch (err: unknown) {
 		resetState();

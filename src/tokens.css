@@ -23,7 +23,19 @@
 	--sl-clickable: var(--default-clickable-area, 44px);
 	--sl-font: var(--font-face, "Space Grotesk", system-ui, sans-serif);
 
-	color-scheme: light dark;
+	/* The fallback palette above is light only. Claiming `light dark` let the UA
+	 * paint checkboxes and selects dark on a dark-mode OS while the page around
+	 * them stayed light, so standalone the app declares just what it paints. */
+	color-scheme: light;
+}
+
+/* Embedded, the palette is whatever the host injected. Nextcloud gates its own
+ * dark theme on this very query, so when the host is dark the OS is too and the
+ * controls should follow it. */
+@media (prefers-color-scheme: dark) {
+	:root[data-embed='1'] {
+		color-scheme: dark;
+	}
 }
 
 * {
