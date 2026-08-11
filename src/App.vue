@@ -25,6 +25,16 @@ const DIMMED_COLUMNS = [
 	'Studien_Ort',
 	'Studien_Straße',
 ];
+const WORKSPACE_TABS = [
+	{ value: 'export', label: 'Filtern+Exportieren' },
+	{ value: 'budget', label: 'StV-Budget' },
+];
+// Shared by the rendered budget table and its clipboard copy, so the two cannot drift.
+const BUDGET_COLUMNS = ['StV', 'Studierende', 'Anteil', 'Budget'];
+const BUDGET_TOTAL_LABEL = 'Gesamt';
+// The share of the student contribution revenue that is split between the StVs.
+const BUDGET_SHARE = 0.3;
+const BUDGET_SHARE_LABEL = `davon ${BUDGET_SHARE * 100}%`;
 // Order matters twice: the buttons render in it, and the first available mode
 // past "alle Studierenden" becomes the default once a sheet is loaded.
 const FILTER_MODES = [
@@ -97,6 +107,26 @@ function formatStudyPrettyName(name: string, level: string) {
 	const cleanLevel = level.trim();
 	if (!cleanName || !cleanLevel) return '';
 	return `${cleanName} (${cleanLevel})`;
+}
+
+const percentFormatter = new Intl.NumberFormat('de-AT', {
+	style: 'percent',
+	minimumFractionDigits: 1,
+	maximumFractionDigits: 1,
+});
+
+function formatShare(share: number) {
+	return percentFormatter.format(share);
+}
+
+const currencyFormatter = new Intl.NumberFormat('de-AT', {
+	style: 'currency',
+	currency: 'EUR',
+});
+
+/** Money is carried in whole cents throughout, so the split stays exact. */
+function formatCurrency(cents: number) {
+	return currencyFormatter.format(cents / 100);
 }
 
 function sortStudyLevels(levels: Iterable<string>) {
@@ -235,6 +265,8 @@ const selectedColumns = ref<string[]>([]);
 const filterColumn = ref('');
 const selectedStudium = ref<string[]>([]);
 const error = ref('');
+const activeTab = ref('export');
+const revenueInput = ref('');
 const exportMode = ref<'student' | 'statistics'>('student');
 const studyNameLookup = ref<Map<string, string>>(new Map());
 const stvLookup = ref<Map<string, string>>(new Map());
@@ -355,9 +387,10 @@ function isFilterModeAvailable(mode: string) {
 
 // The StVs each row belongs to; a student with multiple studies can belong to several.
 const rowStvs = computed(() => {
-	if (!isStvMode.value || columnIndex.value < 0) return [];
+	const studiumIndex = studiumColumnIndex.value;
+	if (studiumIndex < 0) return [];
 	return rows.value.map((row) => {
-		const keys = splitStudiumKeys(row[columnIndex.value]);
+		const keys = splitStudiumKeys(row[studiumIndex]);
 		if (keys.length === 0) return [NO_STV];
 		return unique(
 			keys.map((key) => {
@@ -367,6 +400,164 @@ const rowStvs = computed(() => {
 		);
 	});
 });
+
+/** Distinct students per StV across the whole sheet, independent of the current
+ * filter: several studies of one student can share an StV, and one student can
+ * fall under several StVs and is then counted under each. */
+const stvStudentCounts = computed(() => {
+	const studentsByStv = new Map<string, Set<string>>();
+	rows.value.forEach((row, index) => {
+		const student = studentIdentity(row);
+		(rowStvs.value[index] ?? []).forEach((stv) => {
+			const students = studentsByStv.get(stv) ?? new Set<string>();
+			students.add(student);
+			studentsByStv.set(stv, students);
+		});
+	});
+	const counts = new Map<string, number>();
+	studentsByStv.forEach((students, stv) => counts.set(stv, students.size));
+	return counts;
+});
+
+const revenueCents = computed(() => {
+	const value = Number.parseFloat(revenueInput.value.replace(',', '.'));
+	return Number.isFinite(value) && value > 0 ? Math.round(value * 100) : 0;
+});
+
+const budgetPoolCents = computed(() => Math.round(revenueCents.value * BUDGET_SHARE));
+
+/** Splits the pool across the StVs in proportion to their headcounts, by the
+ * largest remainder method: hand every StV its whole cents, then give the odd
+ * cents left over to the largest fractions. Rounding each share on its own
+ * would leave the column a few cents off the pool it is meant to add up to. */
+function apportionCents(pool: number, weights: number[]) {
+	const total = weights.reduce((sum, weight) => sum + weight, 0);
+	if (total <= 0 || pool <= 0) return weights.map(() => 0);
+
+	const exact = weights.map((weight) => (pool * weight) / total);
+	const amounts = exact.map((value) => Math.floor(value));
+	let leftover = pool - amounts.reduce((sum, value) => sum + value, 0);
+
+	exact
+		.map((value, index) => ({ index, remainder: value - Math.floor(value) }))
+		// ties resolved by position, so the same input always splits the same way
+		.sort((left, right) => right.remainder - left.remainder || left.index - right.index)
+		.forEach(({ index }) => {
+			if (leftover > 0) {
+				amounts[index] += 1;
+				leftover -= 1;
+			}
+		});
+
+	return amounts;
+}
+
+/** Every known StV with its headcount, share of the whole and slice of the
+ * pool. The share is of the column total rather than of the student body: a
+ * student under two StVs counts for both, so the shares still add up to 100%
+ * while the total sits above the number of students. */
+const stvBudget = computed(() => {
+	const counts = stvStudentCounts.value;
+	const names = unique([...stvLabelLookup.value.keys(), ...counts.keys()]).filter(
+		(name) => name !== NO_STV,
+	);
+	const entries = names
+		.map((name) => ({
+			name,
+			label: stvLabelLookup.value.get(name) ?? name,
+			students: counts.get(name) ?? 0,
+		}))
+		.sort((left, right) => left.label.localeCompare(right.label, 'de', { sensitivity: 'base' }));
+	const total = entries.reduce((sum, entry) => sum + entry.students, 0);
+	const amounts = apportionCents(
+		budgetPoolCents.value,
+		entries.map((entry) => entry.students),
+	);
+	return {
+		entries: entries.map((entry, index) => ({
+			...entry,
+			share: total > 0 ? entry.students / total : 0,
+			amountCents: amounts[index] ?? 0,
+		})),
+		total,
+		// the column's own sum, which the apportionment keeps equal to the pool
+		totalAmountCents: amounts.reduce((sum, value) => sum + value, 0),
+		withoutStv: counts.get(NO_STV) ?? 0,
+	};
+});
+
+/** Tab separated rows, which is what spreadsheets read a plain text paste as:
+ * one cell per tab, one row per newline. Values are the rendered ones, so the
+ * pasted table matches the displayed one. */
+const stvBudgetAsTsv = computed(() => {
+	const budget = stvBudget.value;
+	return [
+		BUDGET_COLUMNS,
+		...budget.entries.map((entry) => [
+			entry.label,
+			String(entry.students),
+			formatShare(entry.share),
+			formatCurrency(entry.amountCents),
+		]),
+		[
+			BUDGET_TOTAL_LABEL,
+			String(budget.total),
+			formatShare(budget.total > 0 ? 1 : 0),
+			formatCurrency(budget.totalAmountCents),
+		],
+	]
+		.map((cells) => cells.join('\t'))
+		.join('\n');
+});
+
+/** The async clipboard needs a secure context and, framed, a clipboard-write
+ * permission policy from the host; fall back to the old selection copy, which
+ * needs neither, rather than leaving the button dead when embedded. */
+function writeToClipboard(text: string) {
+	if (navigator.clipboard?.writeText) {
+		return navigator.clipboard.writeText(text).catch(() => {
+			if (!copyViaSelection(text)) throw new Error('clipboard unavailable');
+		});
+	}
+	return copyViaSelection(text)
+		? Promise.resolve()
+		: Promise.reject(new Error('clipboard unavailable'));
+}
+
+function copyViaSelection(text: string) {
+	const textarea = document.createElement('textarea');
+	textarea.value = text;
+	textarea.setAttribute('readonly', '');
+	textarea.style.position = 'fixed';
+	textarea.style.top = '0';
+	textarea.style.opacity = '0';
+	document.body.appendChild(textarea);
+	textarea.select();
+	let copied = false;
+	try {
+		copied = document.execCommand('copy');
+	} catch {
+		copied = false;
+	}
+	document.body.removeChild(textarea);
+	return copied;
+}
+
+const copyState = ref<'idle' | 'copied' | 'failed'>('idle');
+let copyStateTimer = 0;
+
+async function copyBudgetTable() {
+	try {
+		await writeToClipboard(stvBudgetAsTsv.value);
+		copyState.value = 'copied';
+	} catch {
+		copyState.value = 'failed';
+	}
+	window.clearTimeout(copyStateTimer);
+	copyStateTimer = window.setTimeout(() => {
+		copyState.value = 'idle';
+	}, 2500);
+}
 
 const studiumOptions = computed(() => {
 	if (columnIndex.value < 0) return [];
@@ -395,20 +586,8 @@ const studiumOptions = computed(() => {
 const studiumCounts = computed(() => {
 	const counts = new Map<string, number>();
 	if (columnIndex.value < 0) return counts;
-	if (isStvMode.value) {
-		// Students, not enrolments: several studies of one student can share an StV.
-		const studentsByStv = new Map<string, Set<string>>();
-		rows.value.forEach((row, index) => {
-			const student = studentIdentity(row);
-			(rowStvs.value[index] ?? []).forEach((stv) => {
-				const students = studentsByStv.get(stv) ?? new Set<string>();
-				students.add(student);
-				studentsByStv.set(stv, students);
-			});
-		});
-		studentsByStv.forEach((students, stv) => counts.set(stv, students.size));
-		return counts;
-	}
+	// Students, not enrolments: several studies of one student can share an StV.
+	if (isStvMode.value) return stvStudentCounts.value;
 	rows.value.forEach((row) => {
 		const value = String(row[columnIndex.value] ?? '');
 		counts.set(value, (counts.get(value) ?? 0) + 1);
@@ -802,89 +981,195 @@ async function handleDownload() {
 			</div>
 		</header>
 
-		<main v-if="headers.length > 0" class="panels">
-			<section class="panel">
-				<div class="panel-head">
-					<h2>Spalten</h2>
-					<label class="inline-check">
-						<input type="checkbox" :checked="allColumnsSelected" @change="selectAllColumns">
-						<span>Alle Spalten</span>
-					</label>
-				</div>
-				<div class="column-grid">
-					<label v-for="header in headers" :key="header" class="chip">
-						<input
-							type="checkbox"
-							:checked="selectedColumns.includes(header)"
-							@change="toggleColumn(header)">
-						<span :class="dimmedLookup.has(header.toLowerCase()) ? 'chip-dimmed' : 'chip-label'">
-							{{ header }}
-						</span>
-					</label>
-				</div>
-			</section>
+		<main v-if="headers.length > 0" class="workspace">
+			<div class="tabs" role="tablist">
+				<button
+					v-for="tab in WORKSPACE_TABS"
+					:id="`tab-${tab.value}`"
+					:key="tab.value"
+					type="button"
+					role="tab"
+					:aria-selected="activeTab === tab.value"
+					:aria-controls="`panel-${tab.value}`"
+					:class="['tab', { 'tab--active': activeTab === tab.value }]"
+					@click="activeTab = tab.value">
+					{{ tab.label }}
+				</button>
+			</div>
 
-			<section class="panel">
-				<div class="panel-head">
-					<h2>Studium-Filter</h2>
-					<div class="mode-buttons">
-						<button
-							v-for="mode in FILTER_MODES"
-							:key="mode.value || 'none'"
-							type="button"
-							:disabled="!isFilterModeAvailable(mode.value)"
-							:class="['mode-button', { 'mode-button--active': filterColumn === mode.value }]"
-							@click="selectFilterColumn(mode.value)">
-							{{ mode.label }}
+			<div
+				v-show="activeTab === 'export'"
+				id="panel-export"
+				class="panels"
+				role="tabpanel"
+				aria-labelledby="tab-export">
+				<section class="panel">
+					<div class="panel-head">
+						<h2>Spalten</h2>
+						<label class="inline-check">
+							<input type="checkbox" :checked="allColumnsSelected" @change="selectAllColumns">
+							<span>Alle Spalten</span>
+						</label>
+					</div>
+					<div class="column-grid">
+						<label v-for="header in headers" :key="header" class="chip">
+							<input
+								type="checkbox"
+								:checked="selectedColumns.includes(header)"
+								@change="toggleColumn(header)">
+							<span :class="dimmedLookup.has(header.toLowerCase()) ? 'chip-dimmed' : 'chip-label'">
+								{{ header }}
+							</span>
+						</label>
+					</div>
+				</section>
+
+				<section class="panel">
+					<div class="panel-head">
+						<h2>Studium-Filter</h2>
+						<div class="mode-buttons">
+							<button
+								v-for="mode in FILTER_MODES"
+								:key="mode.value || 'none'"
+								type="button"
+								:disabled="!isFilterModeAvailable(mode.value)"
+								:class="['mode-button', { 'mode-button--active': filterColumn === mode.value }]"
+								@click="selectFilterColumn(mode.value)">
+								{{ mode.label }}
+							</button>
+						</div>
+					</div>
+					<p v-if="filterColumn === ''" class="muted">
+						Kein Filter ausgewählt, somit werden die Daten aller Studierenden
+						exportiert. Wähle "Studium", "StV" oder "Hörer*status", um Einträge zu filtern.
+					</p>
+					<div v-else class="option-list">
+						<p v-if="isStvMode" class="muted">
+							Exportiert alle Studierenden, deren Studium laut Studiendaten der gewählten StV
+							zugeordnet ist. Mehrfachstudien zählen zu jeder betroffenen StV.
+						</p>
+						<label v-for="value in studiumOptions" :key="String(value)" class="option">
+							<input
+								type="checkbox"
+								:checked="selectedStudium.includes(value)"
+								@change="toggleStudium(value)">
+							<span class="option-label">{{ filterOptionLabel(value) }}</span>
+							<span class="count">{{ studiumCounts.get(value) ?? 0 }}</span>
+						</label>
+					</div>
+				</section>
+
+				<section class="panel panel--export">
+					<div>
+						<h2>Export</h2>
+						<p class="muted">
+							{{ missingFilterSelection
+								? 'Bitte wähle mindestens eine Filterkategorie zum Exportieren'
+								: `${processedRows.length} Zeilen nach Filterung und Spaltenauswahl.` }}
+						</p>
+					</div>
+					<div class="export-actions">
+						<button type="button" class="primary" :disabled="!canDownload" @click="handleDownload">
+							Gefilterte Excel-Datei herunterladen
 						</button>
+						<label class="inline-check">
+							<span>Exportmodus</span>
+							<select v-model="exportMode">
+								<option value="student">Studierendenzentriert</option>
+								<option value="statistics">Statistikzentriert</option>
+							</select>
+						</label>
+						<span class="hint">
+							{{ exportMode === 'student'
+								? 'Studierende mit Mehrfachstudien werden zu einem Eintrag zusammengeführt und Studium-Werte kombiniert.'
+								: 'Studierende mit Mehrfachstudien bleiben als separate Einträge erhalten; Matrikelnummer wird durch eine Zufalls-ID ersetzt.' }}
+						</span>
+					</div>
+				</section>
+			</div>
+
+			<section
+				v-show="activeTab === 'budget'"
+				id="panel-budget"
+				class="panel"
+				role="tabpanel"
+				aria-labelledby="tab-budget">
+				<div class="panel-head">
+					<h2>StV-Budget</h2>
+					<div class="copy-action">
+						<button
+							type="button"
+							class="copy-button"
+							aria-label="Tabelle in die Zwischenablage kopieren"
+							@click="copyBudgetTable">
+							Kopieren
+						</button>
+						<span class="copy-status" role="status">
+							{{ copyState === 'copied'
+								? 'In die Zwischenablage kopiert'
+								: copyState === 'failed'
+									? 'Kopieren nicht möglich'
+									: '' }}
+						</span>
 					</div>
 				</div>
-				<p v-if="filterColumn === ''" class="muted">
-					Kein Filter ausgewählt, somit werden die Daten aller Studierenden
-					exportiert. Wähle "Studium", "StV" oder "Hörer*status", um Einträge zu filtern.
+				<p class="muted">
+					Anzahl der Studierenden, für die jede StV zuständig ist. Studierende mit
+					Mehrfachstudien zählen für jede betroffene StV, daher liegt die Summe über der
+					Zahl der Studierenden und die Prozentanteile beziehen sich auf diese Summe.
 				</p>
-				<div v-else class="option-list">
-					<p v-if="isStvMode" class="muted">
-						Exportiert alle Studierenden, deren Studium laut Studiendaten der gewählten StV
-						zugeordnet ist. Mehrfachstudien zählen zu jeder betroffenen StV.
-					</p>
-					<label v-for="value in studiumOptions" :key="String(value)" class="option">
+				<div class="budget-inputs">
+					<label class="budget-field">
+						<span class="budget-field-label">Erträge Studierendenbeiträge</span>
 						<input
-							type="checkbox"
-							:checked="selectedStudium.includes(value)"
-							@change="toggleStudium(value)">
-						<span class="option-label">{{ filterOptionLabel(value) }}</span>
-						<span class="count">{{ studiumCounts.get(value) ?? 0 }}</span>
+							v-model="revenueInput"
+							class="budget-input"
+							type="number"
+							min="0"
+							step="0.01"
+							inputmode="decimal"
+							placeholder="0,00">
 					</label>
+					<div class="budget-field">
+						<span class="budget-field-label">{{ BUDGET_SHARE_LABEL }}</span>
+						<output class="budget-output">{{ formatCurrency(budgetPoolCents) }}</output>
+					</div>
 				</div>
-			</section>
-
-			<section class="panel panel--export">
-				<div>
-					<h2>Export</h2>
-					<p class="muted">
-						{{ missingFilterSelection
-							? 'Bitte wähle mindestens eine Filterkategorie zum Exportieren'
-							: `${processedRows.length} Zeilen nach Filterung und Spaltenauswahl.` }}
-					</p>
+				<div class="table-scroll">
+					<table class="budget-table">
+						<thead>
+							<tr>
+								<th
+									v-for="(column, index) in BUDGET_COLUMNS"
+									:key="column"
+									scope="col"
+									:class="{ numeric: index > 0 }">
+									{{ column }}
+								</th>
+							</tr>
+						</thead>
+						<tbody>
+							<tr v-for="entry in stvBudget.entries" :key="entry.name">
+								<td>{{ entry.label }}</td>
+								<td class="numeric">{{ entry.students }}</td>
+								<td class="numeric">{{ formatShare(entry.share) }}</td>
+								<td class="numeric">{{ formatCurrency(entry.amountCents) }}</td>
+							</tr>
+						</tbody>
+						<tfoot>
+							<tr>
+								<th scope="row">{{ BUDGET_TOTAL_LABEL }}</th>
+								<td class="numeric">{{ stvBudget.total }}</td>
+								<td class="numeric">{{ formatShare(stvBudget.total > 0 ? 1 : 0) }}</td>
+								<td class="numeric">{{ formatCurrency(stvBudget.totalAmountCents) }}</td>
+							</tr>
+						</tfoot>
+					</table>
 				</div>
-				<div class="export-actions">
-					<button type="button" class="primary" :disabled="!canDownload" @click="handleDownload">
-						Gefilterte Excel-Datei herunterladen
-					</button>
-					<label class="inline-check">
-						<span>Exportmodus</span>
-						<select v-model="exportMode">
-							<option value="student">Studierendenzentriert</option>
-							<option value="statistics">Statistikzentriert</option>
-						</select>
-					</label>
-					<span class="hint">
-						{{ exportMode === 'student'
-							? 'Studierende mit Mehrfachstudien werden zu einem Eintrag zusammengeführt und Studium-Werte kombiniert.'
-							: 'Studierende mit Mehrfachstudien bleiben als separate Einträge erhalten; Matrikelnummer wird durch eine Zufalls-ID ersetzt.' }}
-					</span>
-				</div>
+				<p v-if="stvBudget.withoutStv > 0" class="muted">
+					{{ stvBudget.withoutStv }} Studierende sind keiner StV zugeordnet und bleiben in
+					dieser Aufstellung unberücksichtigt.
+				</p>
 			</section>
 		</main>
 	</div>
@@ -985,9 +1270,149 @@ h2 {
 	color: var(--sl-error);
 }
 
+.workspace {
+	display: grid;
+	gap: 16px;
+}
+
+.tabs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 4px;
+	border-bottom: 1px solid var(--sl-border);
+}
+
+.tab {
+	font: inherit;
+	border: 1px solid transparent;
+	border-bottom: none;
+	border-radius: var(--sl-radius) var(--sl-radius) 0 0;
+	background: none;
+	color: var(--sl-text-muted);
+	padding: 8px 16px;
+	min-height: var(--sl-clickable);
+	cursor: pointer;
+	/* sits on the tablist border so the active tab reads as joined to its panel */
+	margin-bottom: -1px;
+}
+
+.tab--active {
+	border-color: var(--sl-border);
+	background: var(--sl-background);
+	color: var(--sl-text);
+	font-weight: 600;
+}
+
 .panels {
 	display: grid;
 	gap: 16px;
+}
+
+.copy-action {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.copy-button {
+	font: inherit;
+	font-size: 13px;
+	border-radius: var(--sl-radius);
+	border: 1px solid var(--sl-border);
+	background: var(--sl-hover);
+	color: var(--sl-text);
+	padding: 6px 12px;
+	cursor: pointer;
+}
+
+.copy-status {
+	font-size: 13px;
+	color: var(--sl-text-muted);
+}
+
+.budget-inputs {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 16px;
+	margin-top: 16px;
+}
+
+.budget-field {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.budget-field-label {
+	font-size: 13px;
+	color: var(--sl-text-muted);
+}
+
+.budget-input,
+.budget-output {
+	font: inherit;
+	border-radius: var(--sl-radius);
+	border: 1px solid var(--sl-border);
+	padding: 8px 12px;
+	min-height: var(--sl-clickable);
+	min-width: 12ch;
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+	color: var(--sl-text);
+}
+
+.budget-input {
+	background: var(--sl-background);
+}
+
+/* computed, not editable: reads as a readout rather than as another field */
+.budget-output {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	background: var(--sl-hover);
+	font-weight: 600;
+}
+
+.table-scroll {
+	overflow-x: auto;
+}
+
+.budget-table {
+	width: 100%;
+	border-collapse: collapse;
+	margin-top: 16px;
+}
+
+.budget-table th,
+.budget-table td {
+	text-align: left;
+	padding: 8px 12px;
+	border-bottom: 1px solid var(--sl-border);
+	white-space: nowrap;
+}
+
+.budget-table thead th {
+	font-size: 13px;
+	color: var(--sl-text-muted);
+	font-weight: 600;
+}
+
+.budget-table tbody tr:hover {
+	background: var(--sl-hover);
+}
+
+.budget-table .numeric {
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+}
+
+.budget-table tfoot th,
+.budget-table tfoot td {
+	border-bottom: none;
+	border-top: 2px solid var(--sl-border);
+	font-weight: 600;
 }
 
 .panel {
