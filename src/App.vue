@@ -266,7 +266,7 @@ const filterColumn = ref('');
 const selectedStudium = ref<string[]>([]);
 const error = ref('');
 const activeTab = ref('export');
-const revenueInput = ref('');
+const revenueInput = ref<string | number>('');
 const exportMode = ref<'student' | 'statistics'>('student');
 const studyNameLookup = ref<Map<string, string>>(new Map());
 const stvLookup = ref<Map<string, string>>(new Map());
@@ -420,7 +420,10 @@ const stvStudentCounts = computed(() => {
 });
 
 const revenueCents = computed(() => {
-	const value = Number.parseFloat(revenueInput.value.replace(',', '.'));
+	// v-model casts to a number on type="number" inputs and leaves '' when the
+	// field is empty or mid-edit, so normalise before parsing rather than
+	// trusting the ref to hold the string its type promises.
+	const value = Number.parseFloat(String(revenueInput.value ?? '').replace(',', '.'));
 	return Number.isFinite(value) && value > 0 ? Math.round(value * 100) : 0;
 });
 
@@ -1096,22 +1099,6 @@ async function handleDownload() {
 				aria-labelledby="tab-budget">
 				<div class="panel-head">
 					<h2>StV-Budget</h2>
-					<div class="copy-action">
-						<button
-							type="button"
-							class="copy-button"
-							aria-label="Tabelle in die Zwischenablage kopieren"
-							@click="copyBudgetTable">
-							Kopieren
-						</button>
-						<span class="copy-status" role="status">
-							{{ copyState === 'copied'
-								? 'In die Zwischenablage kopiert'
-								: copyState === 'failed'
-									? 'Kopieren nicht möglich'
-									: '' }}
-						</span>
-					</div>
 				</div>
 				<p class="muted">
 					Anzahl der Studierenden, für die jede StV zuständig ist. Studierende mit
@@ -1134,6 +1121,40 @@ async function handleDownload() {
 						<span class="budget-field-label">{{ BUDGET_SHARE_LABEL }}</span>
 						<output class="budget-output">{{ formatCurrency(budgetPoolCents) }}</output>
 					</div>
+				</div>
+				<div class="table-actions">
+					<span class="copy-status" role="status">
+						{{ copyState === 'copied'
+							? 'In die Zwischenablage kopiert'
+							: copyState === 'failed'
+								? 'Kopieren nicht möglich'
+								: '' }}
+					</span>
+					<button
+						type="button"
+						class="copy-button"
+						title="Tabelle in die Zwischenablage kopieren"
+						aria-label="Tabelle in die Zwischenablage kopieren"
+						@click="copyBudgetTable">
+						<svg
+							class="copy-icon"
+							viewBox="0 0 24 24"
+							fill="none"
+							stroke="currentColor"
+							stroke-width="2"
+							stroke-linecap="round"
+							stroke-linejoin="round"
+							aria-hidden="true"
+							focusable="false">
+							<template v-if="copyState === 'copied'">
+								<path d="M20 6 9 17l-5-5" />
+							</template>
+							<template v-else>
+								<rect x="8" y="2" width="8" height="4" rx="1" />
+								<path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" />
+							</template>
+						</svg>
+					</button>
 				</div>
 				<div class="table-scroll">
 					<table class="budget-table">
@@ -1275,32 +1296,40 @@ h2 {
 	gap: 16px;
 }
 
+/* laid out like the studentstats2025 view tabs: equal columns across the full
+ * width, underlined rather than boxed */
 .tabs {
-	display: flex;
-	flex-wrap: wrap;
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
 	gap: 4px;
 	border-bottom: 1px solid var(--sl-border);
 }
 
 .tab {
+	min-width: 0;
 	font: inherit;
-	border: 1px solid transparent;
-	border-bottom: none;
+	font-weight: 600;
+	border: none;
+	border-bottom: 2px solid transparent;
 	border-radius: var(--sl-radius) var(--sl-radius) 0 0;
-	background: none;
+	background: transparent;
 	color: var(--sl-text-muted);
-	padding: 8px 16px;
-	min-height: var(--sl-clickable);
+	padding: 12px;
+	min-height: 56px;
+	line-height: 1.2;
+	text-align: center;
+	text-wrap: balance;
 	cursor: pointer;
-	/* sits on the tablist border so the active tab reads as joined to its panel */
-	margin-bottom: -1px;
+}
+
+.tab:hover {
+	background: var(--sl-hover);
+	color: var(--sl-text);
 }
 
 .tab--active {
-	border-color: var(--sl-border);
-	background: var(--sl-background);
+	border-bottom-color: var(--sl-accent);
 	color: var(--sl-text);
-	font-weight: 600;
 }
 
 .panels {
@@ -1308,22 +1337,35 @@ h2 {
 	gap: 16px;
 }
 
-.copy-action {
+/* sits directly on top of the table it copies */
+.table-actions {
 	display: flex;
 	align-items: center;
+	justify-content: flex-end;
 	gap: 8px;
-	flex-wrap: wrap;
+	margin-top: 16px;
 }
 
 .copy-button {
-	font: inherit;
-	font-size: 13px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
 	border-radius: var(--sl-radius);
 	border: 1px solid var(--sl-border);
 	background: var(--sl-hover);
 	color: var(--sl-text);
-	padding: 6px 12px;
+	padding: 6px;
 	cursor: pointer;
+}
+
+.copy-button:hover {
+	border-color: var(--sl-accent);
+	color: var(--sl-accent);
+}
+
+.copy-icon {
+	width: 18px;
+	height: 18px;
 }
 
 .copy-status {
@@ -1382,7 +1424,7 @@ h2 {
 .budget-table {
 	width: 100%;
 	border-collapse: collapse;
-	margin-top: 16px;
+	margin-top: 8px;
 }
 
 .budget-table th,
