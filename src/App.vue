@@ -30,7 +30,7 @@ const WORKSPACE_TABS = [
 	{ value: 'budget', label: 'StV-Budget' },
 ];
 // Shared by the rendered budget table and its clipboard copy, so the two cannot drift.
-const BUDGET_COLUMNS = ['StV', 'Studierende', 'Anteil', 'Budget'];
+const BUDGET_COLUMNS = ['StV', 'Studierende', 'Anteil', 'Sockel', 'Budget anteilig', 'Budget'];
 const BUDGET_TOTAL_LABEL = 'Gesamt';
 // The share of the student contribution revenue that is split between the StVs.
 const BUDGET_SHARE = 0.3;
@@ -115,6 +115,11 @@ const percentFormatter = new Intl.NumberFormat('de-AT', {
 	maximumFractionDigits: 1,
 });
 
+const decimalFormatter = new Intl.NumberFormat('de-AT', {
+	minimumFractionDigits: 2,
+	maximumFractionDigits: 2,
+});
+
 function formatShare(share: number) {
 	return percentFormatter.format(share);
 }
@@ -127,6 +132,21 @@ const currencyFormatter = new Intl.NumberFormat('de-AT', {
 /** Money is carried in whole cents throughout, so the split stays exact. */
 function formatCurrency(cents: number) {
 	return currencyFormatter.format(cents / 100);
+}
+
+function formatCurrencyInput(value: string | number) {
+	const amount = parseCurrencyInput(value);
+	return Number.isFinite(amount) && amount >= 0 ? decimalFormatter.format(amount) : String(value ?? '');
+}
+
+function parseCurrencyInput(value: string | number) {
+	const normalized = String(value ?? '')
+		.trim()
+		.replace(/€/g, '')
+		.replace(/\s/g, '')
+		.replace(/\.(?=\d{3}(?:,|$))/g, '')
+		.replace(',', '.');
+	return Number.parseFloat(normalized);
 }
 
 function sortStudyLevels(levels: Iterable<string>) {
@@ -267,6 +287,7 @@ const selectedStudium = ref<string[]>([]);
 const error = ref('');
 const activeTab = ref('export');
 const revenueInput = ref<string | number>('');
+const baseBudgetInput = ref<string | number>(300);
 const exportMode = ref<'student' | 'statistics'>('student');
 const studyNameLookup = ref<Map<string, string>>(new Map());
 const stvLookup = ref<Map<string, string>>(new Map());
@@ -420,14 +441,16 @@ const stvStudentCounts = computed(() => {
 });
 
 const revenueCents = computed(() => {
-	// v-model casts to a number on type="number" inputs and leaves '' when the
-	// field is empty or mid-edit, so normalise before parsing rather than
-	// trusting the ref to hold the string its type promises.
-	const value = Number.parseFloat(String(revenueInput.value ?? '').replace(',', '.'));
+	const value = parseCurrencyInput(revenueInput.value);
 	return Number.isFinite(value) && value > 0 ? Math.round(value * 100) : 0;
 });
 
 const budgetPoolCents = computed(() => Math.round(revenueCents.value * BUDGET_SHARE));
+
+const baseBudgetCents = computed(() => {
+	const value = parseCurrencyInput(baseBudgetInput.value);
+	return Number.isFinite(value) && value > 0 ? Math.round(value * 100) : 0;
+});
 
 /** Splits the pool across the StVs in proportion to their headcounts, by the
  * largest remainder method: hand every StV its whole cents, then give the odd
@@ -472,19 +495,28 @@ const stvBudget = computed(() => {
 		}))
 		.sort((left, right) => left.label.localeCompare(right.label, 'de', { sensitivity: 'base' }));
 	const total = entries.reduce((sum, entry) => sum + entry.students, 0);
-	const amounts = apportionCents(
-		budgetPoolCents.value,
+	const proportionalPoolCents = Math.max(
+		0,
+		budgetPoolCents.value - baseBudgetCents.value * entries.length,
+	);
+	const proportionalAmounts = apportionCents(
+		proportionalPoolCents,
 		entries.map((entry) => entry.students),
 	);
 	return {
 		entries: entries.map((entry, index) => ({
 			...entry,
 			share: total > 0 ? entry.students / total : 0,
-			amountCents: amounts[index] ?? 0,
+			baseCents: baseBudgetCents.value,
+			proportionalCents: proportionalAmounts[index] ?? 0,
+			amountCents: baseBudgetCents.value + (proportionalAmounts[index] ?? 0),
 		})),
 		total,
-		// the column's own sum, which the apportionment keeps equal to the pool
-		totalAmountCents: amounts.reduce((sum, value) => sum + value, 0),
+		baseAmountCents: baseBudgetCents.value * entries.length,
+		proportionalAmountCents: proportionalAmounts.reduce((sum, value) => sum + value, 0),
+		totalAmountCents:
+			baseBudgetCents.value * entries.length +
+			proportionalAmounts.reduce((sum, value) => sum + value, 0),
 		withoutStv: counts.get(NO_STV) ?? 0,
 	};
 });
@@ -500,12 +532,16 @@ const stvBudgetAsTsv = computed(() => {
 			entry.label,
 			String(entry.students),
 			formatShare(entry.share),
+			formatCurrency(entry.baseCents),
+			formatCurrency(entry.proportionalCents),
 			formatCurrency(entry.amountCents),
 		]),
 		[
 			BUDGET_TOTAL_LABEL,
 			String(budget.total),
 			formatShare(budget.total > 0 ? 1 : 0),
+			formatCurrency(budget.baseAmountCents),
+			formatCurrency(budget.proportionalAmountCents),
 			formatCurrency(budget.totalAmountCents),
 		],
 	]
@@ -1108,19 +1144,36 @@ async function handleDownload() {
 				<div class="budget-inputs">
 					<label class="budget-field">
 						<span class="budget-field-label">Erträge Studierendenbeiträge</span>
-						<input
-							v-model="revenueInput"
-							class="budget-input"
-							type="number"
-							min="0"
-							step="0.01"
-							inputmode="decimal"
-							placeholder="0,00">
+						<div class="currency-input">
+							<span aria-hidden="true">€</span>
+							<input
+								v-model="revenueInput"
+								class="budget-input"
+								type="text"
+								inputmode="decimal"
+								lang="de-AT"
+								placeholder="0,00"
+								@blur="revenueInput = formatCurrencyInput(revenueInput)">
+						</div>
 					</label>
 					<div class="budget-field">
 						<span class="budget-field-label">{{ BUDGET_SHARE_LABEL }}</span>
 						<output class="budget-output">{{ formatCurrency(budgetPoolCents) }}</output>
 					</div>
+					<label class="budget-field">
+						<span class="budget-field-label">Sockel pro StV</span>
+						<div class="currency-input">
+							<span aria-hidden="true">€</span>
+							<input
+								v-model="baseBudgetInput"
+								class="budget-input"
+								type="text"
+								inputmode="decimal"
+								lang="de-AT"
+								placeholder="0,00"
+								@blur="baseBudgetInput = formatCurrencyInput(baseBudgetInput)">
+						</div>
+					</label>
 				</div>
 				<div class="table-actions">
 					<span class="copy-status" role="status">
@@ -1174,6 +1227,8 @@ async function handleDownload() {
 								<td>{{ entry.label }}</td>
 								<td class="numeric">{{ entry.students }}</td>
 								<td class="numeric">{{ formatShare(entry.share) }}</td>
+								<td class="numeric">{{ formatCurrency(entry.baseCents) }}</td>
+								<td class="numeric">{{ formatCurrency(entry.proportionalCents) }}</td>
 								<td class="numeric">{{ formatCurrency(entry.amountCents) }}</td>
 							</tr>
 						</tbody>
@@ -1182,6 +1237,8 @@ async function handleDownload() {
 								<th scope="row">{{ BUDGET_TOTAL_LABEL }}</th>
 								<td class="numeric">{{ stvBudget.total }}</td>
 								<td class="numeric">{{ formatShare(stvBudget.total > 0 ? 1 : 0) }}</td>
+								<td class="numeric">{{ formatCurrency(stvBudget.baseAmountCents) }}</td>
+								<td class="numeric">{{ formatCurrency(stvBudget.proportionalAmountCents) }}</td>
 								<td class="numeric">{{ formatCurrency(stvBudget.totalAmountCents) }}</td>
 							</tr>
 						</tfoot>
@@ -1406,6 +1463,26 @@ h2 {
 
 .budget-input {
 	background: var(--sl-background);
+}
+
+.currency-input {
+	display: flex;
+	align-items: center;
+	border: 1px solid var(--sl-border);
+	border-radius: var(--sl-radius);
+	background: var(--sl-background);
+	padding-left: 12px;
+	color: var(--sl-text-muted);
+}
+
+.currency-input:focus-within {
+	border-color: var(--sl-accent);
+}
+
+.currency-input .budget-input {
+	border: 0;
+	outline: 0;
+	min-width: 10ch;
 }
 
 /* computed, not editable: reads as a readout rather than as another field */
